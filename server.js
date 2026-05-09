@@ -22,6 +22,9 @@ app.use(express.json());
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || "ae55e3445f7e585c6295c103f0f5c245fa7275aa4bea8b9bfbffbf6e7ca6e719";
+// Client token - UI and WS clients must send this to read logs
+// Set CLIENT_TOKEN env var on Render to a secret value only you know
+const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "change_this_to_something_secret";
 const MAX_FINDINGS = 200; // Max entries kept in memory
 
 // ─────────────────────────────────────────────
@@ -137,14 +140,17 @@ app.post("/add-server", authMiddleware, (req, res) => {
 
 /**
  * GET /recent
- * Polled by Aqua Notifier UI to get latest findings.
- * Returns format compatible with the existing Aqua Notifier polling code.
+ * Polled by Garama Notifier UI to get latest findings.
+ * Requires ?token=CLIENT_TOKEN or x-client-token header.
  */
 app.get("/recent", (req, res) => {
+  const token = req.query.token || req.headers["x-client-token"];
+  if (token !== CLIENT_TOKEN) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
   const limit = parseInt(req.query.limit) || 50;
   res.json({
     findings: findings.slice(0, limit),
-    // Also expose as 'logs' for compatibility
     logs: findings.slice(0, limit),
     total: findings.length,
     timestamp: Date.now(),
@@ -152,10 +158,12 @@ app.get("/recent", (req, res) => {
 });
 
 /**
- * GET /servers
- * Returns all active servers with brainrots (for dashboard).
+ * GET /servers - locked too
  */
+
 app.get("/servers", (req, res) => {
+  const token = req.query.token || req.headers["x-client-token"];
+  if (token !== CLIENT_TOKEN) return res.status(403).json({ error: "Unauthorized" });
   const active = Object.values(servers)
     .filter((s) => Date.now() - s.timestamp < 5 * 60 * 1000) // last 5 min
     .sort((a, b) => b.timestamp - a.timestamp);
@@ -178,6 +186,15 @@ app.post("/clear", authMiddleware, (req, res) => {
 // WEBSOCKET
 // ─────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
+  // Check token from query string: ws://url?token=CLIENT_TOKEN
+  const url = new URL(req.url, "http://localhost");
+  const token = url.searchParams.get("token");
+  if (token !== CLIENT_TOKEN) {
+    log("WS", `Rejected unauthorized WS connection`);
+    ws.close(4003, "Unauthorized");
+    return;
+  }
+
   connectedClients++;
   const ip = req.socket.remoteAddress;
   log("WS", `Client connected | IP=${ip} | Total=${connectedClients}`);
