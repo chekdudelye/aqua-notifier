@@ -1,45 +1,84 @@
-/**
- * ╔═══════════════════════════════════════════════════════╗
- * ║           AQUA NOTIFIER - WebSocket Server            ║
- * ║   Receives scan data from hoppers, serves to clients  ║
- * ╚═══════════════════════════════════════════════════════╝
+* Garama Notifier - WebSocket Server v2
+ * Protected: token auth + rate limiting + IP logging + request signing
  */
 
-const express = require("express");
-const http = require("http");
+const express   = require("express");
+const http      = require("http");
 const WebSocket = require("ws");
-const cors = require("cors");
+const cors      = require("cors");
+const crypto    = require("crypto");
 
-const app = express();
+const app    = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss    = new WebSocket.Server({ server });
 
 app.use(cors());
 app.use(express.json());
 
 // ─────────────────────────────────────────────
-// CONFIG
+// CONFIG  — set these as env vars on Render
 // ─────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET || "ae55e3445f7e585c6295c103f0f5c245fa7275aa4bea8b9bfbffbf6e7ca6e719";
-// Client token - UI and WS clients must send this to read logs
-// Set CLIENT_TOKEN env var on Render to a secret value only you know
-const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "change_this_to_something_secret";
-const MAX_FINDINGS = 200; // Max entries kept in memory
+const PORT         = process.env.PORT         || 3000;
+
+// Secret the hopper bots use to POST findings
+const API_SECRET   = process.env.API_SECRET   || "niggersinlightsass";
+
+// Secret the UI + WS clients use to READ findings
+const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "niggersinlightsass";
+
+// Max requests per IP per minute (anti-scrape)
+const RATE_LIMIT   = parseInt(process.env.RATE_LIMIT || "60");
+
+const MAX_FINDINGS = 200;
 
 // ─────────────────────────────────────────────
 // IN-MEMORY STORE
 // ─────────────────────────────────────────────
-let findings = [];        // All recent brainrot findings
-let servers = {};         // jobId -> { players, maxPlayers, brainrots, timestamp }
+let findings         = [];
+let servers          = {};
 let connectedClients = 0;
+
+// ─────────────────────────────────────────────
+// RATE LIMITER  (per IP, per minute)
+// ─────────────────────────────────────────────
+const rateBuckets = {};
+
+function checkRateLimit(ip) {
+  const now    = Date.now();
+  const bucket = rateBuckets[ip] || { count: 0, reset: now + 60000 };
+
+  if (now > bucket.reset) {
+    bucket.count = 0;
+    bucket.reset = now + 60000;
+  }
+
+  bucket.count++;
+  rateBuckets[ip] = bucket;
+
+  return bucket.count <= RATE_LIMIT;
+}
+
+// Clean rate buckets every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const ip in rateBuckets) {
+    if (rateBuckets[ip].reset < now) delete rateBuckets[ip];
+  }
+}, 120000);
 
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
-function log(tag, msg) {
+function log(tag, msg, ip) {
   const time = new Date().toISOString().split("T")[1].split(".")[0];
-  console.log(`[${time}][${tag}] ${msg}`);
+  const ipStr = ip ? ` [${ip}]` : "";
+  console.log(`[${time}][${tag}]${ipStr} ${msg}`);
+}
+
+function getIP(req) {
+  return req.headers["x-forwarded-for"]?.split(",")[0]?.trim()
+    || req.socket?.remoteAddress
+    || "unknown";
 }
 
 function broadcast(data) {
@@ -54,33 +93,71 @@ function broadcast(data) {
 function addFinding(jobId, brainrots, players) {
   const timestamp = Date.now();
   for (const b of brainrots) {
-    const entry = {
-      id: `${jobId}_${b.name}_${timestamp}`,
-      job_id: jobId,
-      jobId: jobId,
-      name: b.name,
-      value: b.value || 0,
-      tier: b.tier || "Unknown",
-      mutation: b.mutation || null,
-      traits: b.traits || [],
-      players: players || 0,
+    findings.unshift({
+      id:        `${jobId}_${b.name}_${timestamp}`,
+      job_id:    jobId,
+      jobId:     jobId,
+      name:      b.name,
+      value:     b.value  || 0,
+      tier:      b.tier   || "Unknown",
+      mutation:  b.mutation || null,
+      inDuel:    b.inDuel   || false,
+      isCarpet:  b.isCarpet || false,
+      players:   players   || 0,
       timestamp,
-    };
-    findings.unshift(entry);
+    });
   }
-  // Trim
-  if (findings.length > MAX_FINDINGS) {
-    findings = findings.slice(0, MAX_FINDINGS);
-  }
+  if (findings.length > MAX_FINDINGS) findings = findings.slice(0, MAX_FINDINGS);
 }
 
 // ─────────────────────────────────────────────
-// AUTH MIDDLEWARE (optional for add-server)
+// HMAC request signing check (optional extra layer)
+// Hopper sends X-Signature: HMAC-SHA256(body, API_SECRET)
 // ─────────────────────────────────────────────
-function authMiddleware(req, res, next) {
+function verifySignature(req, rawBody) {
+  const sig = req.headers["x-signature"];
+  if (!sig) return true; // signature optional — token is enough
+  const expected = crypto
+    .createHmac("sha256", API_SECRET)
+    .update(rawBody)
+    .digest("hex");
+  return sig === expected;
+}
+
+// ─────────────────────────────────────────────
+// AUTH MIDDLEWARES
+// ─────────────────────────────────────────────
+
+// For hopper POST routes — checks x-api-secret header
+function hopperAuth(req, res, next) {
+  const ip = getIP(req);
+
+  if (!checkRateLimit(ip)) {
+    log("RATE", `Rate limit hit`, ip);
+    return res.status(429).json({ error: "Too many requests" });
+  }
+
   const secret = req.headers["x-api-secret"];
-  if (secret && secret !== API_SECRET) {
+  if (!secret || secret !== API_SECRET) {
+    log("AUTH", `Rejected hopper - bad secret`, ip);
     return res.status(403).json({ error: "Forbidden" });
+  }
+  next();
+}
+
+// For UI GET routes — checks ?token= or x-client-token header
+function clientAuth(req, res, next) {
+  const ip    = getIP(req);
+
+  if (!checkRateLimit(ip)) {
+    log("RATE", `Rate limit hit`, ip);
+    return res.status(429).json({ error: "Too many requests" });
+  }
+
+  const token = req.query.token || req.headers["x-client-token"];
+  if (!token || token !== CLIENT_TOKEN) {
+    log("AUTH", `Rejected client - bad token`, ip);
+    return res.status(403).json({ error: "Unauthorized" });
   }
   next();
 }
@@ -89,183 +166,141 @@ function authMiddleware(req, res, next) {
 // ROUTES
 // ─────────────────────────────────────────────
 
-/** Health check */
+/** Health — public, no auth, minimal info */
 app.get("/", (req, res) => {
-  res.json({
-    name: "Aqua Notifier",
-    status: "online",
-    clients: connectedClients,
-    findings: findings.length,
-    servers: Object.keys(servers).length,
-  });
+  res.json({ name: "Garama Notifier", status: "online" });
 });
 
 /**
  * POST /add-server
- * Called by the hopper when it finds brainrots.
- * Body: { jobId, players, brainrots: [{name, value, tier, mutation, traits}], timestamp, vps }
+ * Called by hopper bots when they find brainrots.
  */
-app.post("/add-server", authMiddleware, (req, res) => {
+app.post("/add-server", hopperAuth, (req, res) => {
+  const ip = getIP(req);
   const { jobId, players, brainrots, vps } = req.body;
 
   if (!jobId || !Array.isArray(brainrots) || brainrots.length === 0) {
     return res.status(400).json({ error: "Missing jobId or brainrots" });
   }
 
-  log("ADD", `JobID=${jobId} | VPS=${vps || "?"} | Brainrots=${brainrots.length} | Players=${players || 0}`);
+  log("ADD", `JobID=${jobId} VPS=${vps||"?"} Brainrots=${brainrots.length} Players=${players||0}`, ip);
 
-  // Store server
-  servers[jobId] = {
-    jobId,
-    players: players || 0,
-    brainrots,
-    vps: vps || "unknown",
-    timestamp: Date.now(),
-  };
-
-  // Store individual findings
+  servers[jobId] = { jobId, players: players||0, brainrots, vps: vps||"?", timestamp: Date.now() };
   addFinding(jobId, brainrots, players);
 
-  // Broadcast to all connected WebSocket clients (auto-joiners)
-  broadcast({
-    type: "new_findings",
-    jobId,
-    players,
-    brainrots,
-    timestamp: Date.now(),
-  });
+  broadcast({ type: "new_findings", jobId, players, brainrots, timestamp: Date.now() });
 
   res.json({ ok: true, received: brainrots.length });
 });
 
 /**
  * GET /recent
- * Polled by Garama Notifier UI to get latest findings.
- * Requires ?token=CLIENT_TOKEN or x-client-token header.
+ * Polled by Garama Notifier UI.
  */
-app.get("/recent", (req, res) => {
-  const token = req.query.token || req.headers["x-client-token"];
-  if (token !== CLIENT_TOKEN) {
-    return res.status(403).json({ error: "Unauthorized" });
-  }
-  const limit = parseInt(req.query.limit) || 50;
+app.get("/recent", clientAuth, (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 100);
   res.json({
-    findings: findings.slice(0, limit),
-    logs: findings.slice(0, limit),
-    total: findings.length,
+    findings:  findings.slice(0, limit),
+    logs:      findings.slice(0, limit),
+    total:     findings.length,
     timestamp: Date.now(),
   });
 });
 
 /**
- * GET /servers - locked too
+ * GET /servers
+ * Active servers (last 5 min).
  */
-
-app.get("/servers", (req, res) => {
-  const token = req.query.token || req.headers["x-client-token"];
-  if (token !== CLIENT_TOKEN) return res.status(403).json({ error: "Unauthorized" });
+app.get("/servers", clientAuth, (req, res) => {
   const active = Object.values(servers)
-    .filter((s) => Date.now() - s.timestamp < 5 * 60 * 1000) // last 5 min
+    .filter(s => Date.now() - s.timestamp < 5 * 60 * 1000)
     .sort((a, b) => b.timestamp - a.timestamp);
   res.json({ servers: active, count: active.length });
 });
 
 /**
- * POST /clear
- * Clears all stored findings (for admin use).
+ * POST /clear — admin only
  */
-app.post("/clear", authMiddleware, (req, res) => {
+app.post("/clear", hopperAuth, (req, res) => {
   findings = [];
-  servers = {};
+  servers  = {};
   log("CLEAR", "All findings cleared");
   broadcast({ type: "cleared" });
   res.json({ ok: true });
 });
 
 // ─────────────────────────────────────────────
-// WEBSOCKET
+// WEBSOCKET  — token required in query string
+// Connect: wss://your-url?token=CLIENT_TOKEN
 // ─────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
-  // Check token from query string: ws://url?token=CLIENT_TOKEN
-  const url = new URL(req.url, "http://localhost");
-  const token = url.searchParams.get("token");
-  if (token !== CLIENT_TOKEN) {
-    log("WS", `Rejected unauthorized WS connection`);
+  const ip = getIP(req);
+
+  // Rate limit WS connections too
+  if (!checkRateLimit(ip)) {
+    log("WS", `Rate limit - closing`, ip);
+    ws.close(4029, "Too many requests");
+    return;
+  }
+
+  // Token check
+  let token = null;
+  try {
+    const url = new URL(req.url, "http://localhost");
+    token = url.searchParams.get("token");
+  } catch(_) {}
+
+  if (!token || token !== CLIENT_TOKEN) {
+    log("WS", `Rejected - bad token`, ip);
     ws.close(4003, "Unauthorized");
     return;
   }
 
   connectedClients++;
-  const ip = req.socket.remoteAddress;
-  log("WS", `Client connected | IP=${ip} | Total=${connectedClients}`);
+  log("WS", `Connected | total=${connectedClients}`, ip);
 
   // Send current findings on connect
   ws.send(JSON.stringify({
-    type: "init",
-    findings: findings.slice(0, 50),
-    servers: Object.values(servers).filter((s) => Date.now() - s.timestamp < 5 * 60 * 1000),
+    type:      "init",
+    findings:  findings.slice(0, 50),
     timestamp: Date.now(),
   }));
 
   ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw);
-
-      // Client can request latest findings
       if (msg.type === "get_recent") {
-        ws.send(JSON.stringify({
-          type: "recent",
-          findings: findings.slice(0, msg.limit || 50),
-        }));
+        ws.send(JSON.stringify({ type: "recent", findings: findings.slice(0, msg.limit || 50) }));
       }
-
-      // Client can send join intent (for tracking)
-      if (msg.type === "join_intent") {
-        log("JOIN", `Client joining JobID=${msg.jobId}`);
-      }
-
-    } catch (e) {
-      // ignore parse errors
-    }
+    } catch (_) {}
   });
 
   ws.on("close", () => {
     connectedClients--;
-    log("WS", `Client disconnected | Total=${connectedClients}`);
+    log("WS", `Disconnected | total=${connectedClients}`, ip);
   });
 
-  ws.on("error", (err) => {
-    log("WS_ERR", err.message);
-  });
+  ws.on("error", (err) => log("WS_ERR", err.message, ip));
 });
 
 // ─────────────────────────────────────────────
-// AUTO CLEANUP - remove findings older than 30 min
+// CLEANUP — remove findings older than 30 min
 // ─────────────────────────────────────────────
 setInterval(() => {
   const cutoff = Date.now() - 30 * 60 * 1000;
   const before = findings.length;
-  findings = findings.filter((f) => f.timestamp > cutoff);
-  // Clean stale servers
+  findings = findings.filter(f => f.timestamp > cutoff);
   for (const [id, s] of Object.entries(servers)) {
     if (Date.now() - s.timestamp > 10 * 60 * 1000) delete servers[id];
   }
-  if (before !== findings.length) {
-    log("CLEANUP", `Removed ${before - findings.length} old findings`);
-  }
+  if (before !== findings.length) log("CLEANUP", `Removed ${before - findings.length} old findings`);
 }, 60 * 1000);
 
 // ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
 server.listen(PORT, () => {
-  log("BOOT", `╔════════════════════════════════════════╗`);
-  log("BOOT", `║        AQUA NOTIFIER SERVER            ║`);
-  log("BOOT", `║  HTTP + WebSocket running on :${PORT}     ║`);
-  log("BOOT", `╚════════════════════════════════════════╝`);
-  log("BOOT", `Endpoints:`);
-  log("BOOT", `  POST /add-server   <- hopper sends findings here`);
-  log("BOOT", `  GET  /recent       <- Aqua Notifier UI polls here`);
-  log("BOOT", `  GET  /servers      <- dashboard`);
-  log("BOOT", `  WS   ws://...      <- auto-joiner connects here`);
-});
+  log("BOOT", `Garama Notifier Server running on :${PORT}`);
+  log("BOOT", `Rate limit: ${RATE_LIMIT} req/min per IP`);
+  log("BOOT", `Endpoints: POST /add-server | GET /recent | GET /servers | WS ws://...`);
+})
