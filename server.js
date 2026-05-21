@@ -17,13 +17,13 @@ const PORT = process.env.PORT || 3000;
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "garama2026secret";
 
 // ─────────────────────────────
-// STORAGE
+// MEMORY STORE
 // ─────────────────────────────
 let findings = [];
 let servers  = {};
 
 // ─────────────────────────────
-// HELPERS
+// BROADCAST
 // ─────────────────────────────
 function broadcast(data) {
   const msg = JSON.stringify(data);
@@ -79,11 +79,14 @@ app.get("/recent", (req, res) => {
 });
 
 // ─────────────────────────────
-// 🔥 DASHBOARD (REAL-TIME)
+// DASHBOARD (FIXED)
 // ─────────────────────────────
 app.get("/dashboard", (req, res) => {
   const token = req.query.token;
-  if (token !== CLIENT_TOKEN) return res.status(403).send("Unauthorized");
+
+  if (token !== CLIENT_TOKEN) {
+    return res.status(403).send("Unauthorized");
+  }
 
   res.send(`
 <!DOCTYPE html>
@@ -118,7 +121,7 @@ tr:nth-child(even){background:#151515;}
 <script>
 const token = "${token}";
 
-// 🔥 FIXED WS CONNECTION (Render-safe)
+// WebSocket (REAL TIME)
 const ws = new WebSocket(
   (location.protocol === "https:" ? "wss://" : "ws://") +
   location.host +
@@ -129,13 +132,16 @@ const rows = document.getElementById("rows");
 
 function addRow(f) {
   const tr = document.createElement("tr");
-  tr.innerHTML = `
-    <td>${"${f.name}"}</td>
-    <td>${"${f.value}"}</td>
-    <td>${"${f.tier}"}</td>
-    <td>${"${f.players}"}</td>
-    <td>${"${new Date().toLocaleTimeString()}"}</td>
-  `;
+
+  // ✅ FIXED TEMPLATE STRING (no syntax errors)
+  tr.innerHTML = \`
+    <td>\${f.name}</td>
+    <td>\${f.value}</td>
+    <td>\${f.tier}</td>
+    <td>\${f.players}</td>
+    <td>\${new Date(f.timestamp).toLocaleTimeString()}</td>
+  \`;
+
   rows.prepend(tr);
 }
 
@@ -156,7 +162,8 @@ ws.onmessage = (event) => {
         name: b.name,
         value: b.value,
         tier: b.tier,
-        players: msg.players
+        players: msg.players,
+        timestamp: Date.now()
       });
     });
   }
@@ -180,20 +187,10 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  // heartbeat system
   ws.isAlive = true;
 
   ws.on("pong", () => {
     ws.isAlive = true;
-  });
-
-  ws.on("message", (msg) => {
-    try {
-      const data = JSON.parse(msg);
-      if (data.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong" }));
-      }
-    } catch {}
   });
 
   ws.send(JSON.stringify({
@@ -202,7 +199,7 @@ wss.on("connection", (ws, req) => {
   }));
 });
 
-// kill dead connections (IMPORTANT for Render)
+// heartbeat (prevents Render disconnects)
 setInterval(() => {
   wss.clients.forEach(ws => {
     if (!ws.isAlive) return ws.terminate();
@@ -215,5 +212,5 @@ setInterval(() => {
 // START SERVER
 // ─────────────────────────────
 server.listen(PORT, () => {
-  console.log("🚀 Server running on", PORT);
+  console.log("🚀 Server running on port", PORT);
 });
