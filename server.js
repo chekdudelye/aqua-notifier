@@ -1,6 +1,5 @@
-* Garama Notifier - WebSocket Server v2
- * Protected: token auth + rate limiting + IP logging + request signing
- */
+// Garama Notifier - WebSocket Server v2
+// Protected: token auth + rate limiting + IP logging + request signing
 
 const express   = require("express");
 const http      = require("http");
@@ -112,11 +111,10 @@ function addFinding(jobId, brainrots, players) {
 
 // ─────────────────────────────────────────────
 // HMAC request signing check (optional extra layer)
-// Hopper sends X-Signature: HMAC-SHA256(body, API_SECRET)
 // ─────────────────────────────────────────────
 function verifySignature(req, rawBody) {
   const sig = req.headers["x-signature"];
-  if (!sig) return true; // signature optional — token is enough
+  if (!sig) return true;
   const expected = crypto
     .createHmac("sha256", API_SECRET)
     .update(rawBody)
@@ -128,7 +126,6 @@ function verifySignature(req, rawBody) {
 // AUTH MIDDLEWARES
 // ─────────────────────────────────────────────
 
-// For hopper POST routes — checks x-api-secret header
 function hopperAuth(req, res, next) {
   const ip = getIP(req);
 
@@ -145,9 +142,8 @@ function hopperAuth(req, res, next) {
   next();
 }
 
-// For UI GET routes — checks ?token= or x-client-token header
 function clientAuth(req, res, next) {
-  const ip    = getIP(req);
+  const ip = getIP(req);
 
   if (!checkRateLimit(ip)) {
     log("RATE", `Rate limit hit`, ip);
@@ -166,15 +162,10 @@ function clientAuth(req, res, next) {
 // ROUTES
 // ─────────────────────────────────────────────
 
-/** Health — public, no auth, minimal info */
 app.get("/", (req, res) => {
   res.json({ name: "Garama Notifier", status: "online" });
 });
 
-/**
- * POST /add-server
- * Called by hopper bots when they find brainrots.
- */
 app.post("/add-server", hopperAuth, (req, res) => {
   const ip = getIP(req);
   const { jobId, players, brainrots, vps } = req.body;
@@ -193,10 +184,6 @@ app.post("/add-server", hopperAuth, (req, res) => {
   res.json({ ok: true, received: brainrots.length });
 });
 
-/**
- * GET /recent
- * Polled by Garama Notifier UI.
- */
 app.get("/recent", clientAuth, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 100);
   res.json({
@@ -207,10 +194,6 @@ app.get("/recent", clientAuth, (req, res) => {
   });
 });
 
-/**
- * GET /servers
- * Active servers (last 5 min).
- */
 app.get("/servers", clientAuth, (req, res) => {
   const active = Object.values(servers)
     .filter(s => Date.now() - s.timestamp < 5 * 60 * 1000)
@@ -218,9 +201,6 @@ app.get("/servers", clientAuth, (req, res) => {
   res.json({ servers: active, count: active.length });
 });
 
-/**
- * POST /clear — admin only
- */
 app.post("/clear", hopperAuth, (req, res) => {
   findings = [];
   servers  = {};
@@ -230,20 +210,17 @@ app.post("/clear", hopperAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// WEBSOCKET  — token required in query string
-// Connect: wss://your-url?token=CLIENT_TOKEN
+// WEBSOCKET
 // ─────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
   const ip = getIP(req);
 
-  // Rate limit WS connections too
   if (!checkRateLimit(ip)) {
     log("WS", `Rate limit - closing`, ip);
     ws.close(4029, "Too many requests");
     return;
   }
 
-  // Token check
   let token = null;
   try {
     const url = new URL(req.url, "http://localhost");
@@ -259,10 +236,9 @@ wss.on("connection", (ws, req) => {
   connectedClients++;
   log("WS", `Connected | total=${connectedClients}`, ip);
 
-  // Send current findings on connect
   ws.send(JSON.stringify({
-    type:      "init",
-    findings:  findings.slice(0, 50),
+    type: "init",
+    findings: findings.slice(0, 50),
     timestamp: Date.now(),
   }));
 
@@ -283,24 +259,23 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (err) => log("WS_ERR", err.message, ip));
 });
 
-// ─────────────────────────────────────────────
-// CLEANUP — remove findings older than 30 min
-// ─────────────────────────────────────────────
+// cleanup
 setInterval(() => {
   const cutoff = Date.now() - 30 * 60 * 1000;
   const before = findings.length;
   findings = findings.filter(f => f.timestamp > cutoff);
+
   for (const [id, s] of Object.entries(servers)) {
     if (Date.now() - s.timestamp > 10 * 60 * 1000) delete servers[id];
   }
-  if (before !== findings.length) log("CLEANUP", `Removed ${before - findings.length} old findings`);
+
+  if (before !== findings.length)
+    log("CLEANUP", `Removed ${before - findings.length} old findings`);
 }, 60 * 1000);
 
-// ─────────────────────────────────────────────
 // START
-// ─────────────────────────────────────────────
 server.listen(PORT, () => {
   log("BOOT", `Garama Notifier Server running on :${PORT}`);
   log("BOOT", `Rate limit: ${RATE_LIMIT} req/min per IP`);
-  log("BOOT", `Endpoints: POST /add-server | GET /recent | GET /servers | WS ws://...`);
-})
+  log("BOOT", `Endpoints: POST /add-server | GET /recent | GET /servers | WS`);
+});
