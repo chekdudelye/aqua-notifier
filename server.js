@@ -21,10 +21,10 @@ app.use(express.json());
 const PORT         = process.env.PORT         || 3000;
 
 // Secret the hopper bots use to POST findings
-const API_SECRET   = process.env.API_SECRET   || "niggersinlightsass";
+const API_SECRET   = process.env.API_SECRET   || "garama2026secret";
 
 // Secret the UI + WS clients use to READ findings
-const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "niggersinlightsass";
+const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "garama2026secret";
 
 // Max requests per IP per minute (anti-scrape)
 const RATE_LIMIT   = parseInt(process.env.RATE_LIMIT || "60");
