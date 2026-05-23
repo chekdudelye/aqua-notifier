@@ -1,5 +1,5 @@
 /**
- * Garama Notifier - WebSocket Server v2 (Patched)
+ * Garama Notifier - WebSocket Server v2 (Production Fixed)
  * Protected: token auth + rate limiting + IP logging + request signing
  */
 const express = require("express");
@@ -10,7 +10,9 @@ const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+
+// Mount the WebSocket server directly with no autonomous route tracking
+const wss = new WebSocket.Server({ noServer: true });
 
 app.use(cors());
 
@@ -22,11 +24,12 @@ app.use(express.json({
 }));
 
 //
-// CONFIG (Set these as env vars on Render or keep defaults for local testing)
+// CONFIG (Explicitly matching your address parameter layout)
 //
 const PORT = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET || "CHANGE_ME_API_SECRET";
-const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "CHANGE_ME_CLIENT_TOKEN";
+const API_SECRET = process.env.API_SECRET || "ae55e3445f7e585c6295c103f0f5c245fa7275aa4bea8b9bfbffbf6e7ca6e719";
+// MATCHED VALUE: Explicitly configured to match your connection URL string exactly
+const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "hange_this_to_something_secret";
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || "60");
 const MAX_FINDINGS = 200;
 
@@ -68,7 +71,8 @@ setInterval(() => {
 // HELPERS
 //
 function log(tag, msg, ip) {
-  const time = new Date().toISOString().split("T")[1].split(".")[0];
+  const fullIso = new Date().toISOString();
+  const time = fullIso.replace("T", " ").substring(0, 19);
   const ipStr = ip ? ` [${ip}]` : "";
   console.log(`[${time}][${tag}]${ipStr} ${msg}`);
 }
@@ -76,12 +80,13 @@ function log(tag, msg, ip) {
 function getIP(req) {
   const forwarded = req.headers["x-forwarded-for"];
   if (forwarded) {
-    return forwarded.split(",")[0].trim();
+    const firstIp = forwarded.split(",");
+    return firstIp ? firstIp[0].trim() : "unknown";
   }
   return req.socket?.remoteAddress || "unknown";
 }
 
-// Broadcast strings to all securely connected websocket connections
+// Broadcast strings to all securely connected websocket connections on /ws
 function broadcast(data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach((client) => {
@@ -115,7 +120,7 @@ function addFinding(encJobId, brainrots, players) {
 //
 function verifySignature(req) {
   const sig = req.headers["x-signature"];
-  if (!sig) return true; // Optional layer 
+  if (!sig) return true; 
   if (!req.rawBody) return false;
 
   const expected = crypto
@@ -226,41 +231,59 @@ app.post("/clear", hopperAuth, (req, res) => {
 });
 
 //
-// WEBSOCKET SERVER LIFECYCLE
+// WEBSOCKET NATIVE PROTOCOL UPGRADE ROUTER (/ws Enforced)
+//
+server.on("upgrade", (request, socket, head) => {
+  const ip = request.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() || request.socket.remoteAddress || "unknown";
+
+  if (!checkRateLimit(ip)) {
+    log("WS_UPGRADE", `Rate limit hit during handshake`, ip);
+    socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  try {
+    const myUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+    const pathname = myUrl.pathname;
+    const token = myUrl.searchParams.get("token");
+
+    // Block anyone who isn't targeting exactly /ws
+    if (pathname !== "/ws") {
+      log("WS_UPGRADE", `Rejected incorrect path: ${pathname}`, ip);
+      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    // Verify token parameters correctly
+    if (!token || token !== CLIENT_TOKEN) {
+      log("WS_UPGRADE", `Rejected bad credentials token`, ip);
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    // Connect fully
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+  } catch (err) {
+    log("WS_UPGRADE_ERR", err.message, ip);
+    socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n");
+    socket.destroy();
+  }
+});
+
+//
+// WEBSOCKET SERVER LIFECYCLE MANAGEMENT
 //
 wss.on("connection", (ws, req) => {
   const ip = getIP(req);
-
-  // Use a slight timeout delay on errors to prevent Code 1005 (Handshake Interruption Error)
-  if (!checkRateLimit(ip)) {
-    log("WS", `Rate limit - closing`, ip);
-    setTimeout(() => {
-      try { ws.close(4029, "Too many requests"); } catch (_) {}
-    }, 50);
-    return;
-  }
-
-  let token = null;
-  try {
-    const requestUrl = req.url || "/";
-    const urlObj = new URL(requestUrl, "http://localhost");
-    token = urlObj.searchParams.get("token");
-  } catch (_) {
-    log("WS_ERR", "Failed parsing query string", ip);
-  }
-
-  if (!token || token !== CLIENT_TOKEN) {
-    log("WS", `Rejected - bad token`, ip);
-    setTimeout(() => {
-      try { ws.close(4003, "Unauthorized"); } catch (_) {}
-    }, 50);
-    return;
-  }
-
   connectedClients++;
   log("WS", `Connected | total=${connectedClients}`, ip);
 
-  // Seed baseline data layout to the UI connection immediately upon initialization
+  // Send baseline data layout upon connection
   ws.send(JSON.stringify({
     type: "init",
     findings: findings.slice(0, 50),
@@ -305,5 +328,5 @@ setInterval(() => {
 server.listen(PORT, () => {
   log("BOOT", `Garama Notifier Server running on :${PORT}`);
   log("BOOT", `Rate limit: ${RATE_LIMIT} req/min per IP`);
-  log("BOOT", `Endpoints: POST /add-server | GET /recent | GET /servers | WS ws://...`);
+  log("BOOT", `WebSocket Sub-Endpoint active: /ws`);
 });
