@@ -96,7 +96,7 @@ function addFinding(encJobId, brainrots, players) {
   for (const b of brainrots) {
     findings.unshift({
       id:        `${encJobId}_${b.name}_${timestamp}`,
-      encJobId:  encJobId,   // encrypted - only UI with key can decrypt
+      encJobId:  encJobId,
       name:      b.name,
       value:     b.value    || 0,
       tier:      b.tier     || "Unknown",
@@ -239,7 +239,7 @@ wss.on("connection", (ws, req) => {
   // Rate limit WS connections too
   if (!checkRateLimit(ip)) {
     log("WS", `Rate limit - closing`, ip);
-    ws.close(4029, "Too many requests");
+    ws.close(1008, "Too many requests");
     return;
   }
 
@@ -252,7 +252,7 @@ wss.on("connection", (ws, req) => {
 
   if (!token || token !== CLIENT_TOKEN) {
     log("WS", `Rejected - bad token`, ip);
-    ws.close(4003, "Unauthorized");
+    ws.close(1008, "Unauthorized");
     return;
   }
 
