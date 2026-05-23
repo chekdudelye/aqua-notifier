@@ -29,7 +29,7 @@ app.use(express.json({
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || "ae55e3445f7e585c6295c103f0f5c245fa7275aa4bea8b9bfbffbf6e7ca6e719";
 // MATCHED VALUE: Explicitly configured to match your connection URL string exactly
-const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "hange_this_to_something_secret";
+const CLIENT_TOKEN = process.env.CLIENT_TOKEN || "lightisdabest";
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || "60");
 const MAX_FINDINGS = 200;
 
